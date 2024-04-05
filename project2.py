@@ -1,30 +1,21 @@
 from flask import Flask, jsonify, request
 from flask_sqlalchemy import SQLAlchemy
-from cryptography.hazmat.primitives import serialization, asymmetric
+from cryptography.hazmat.primitives import serialization
 from cryptography.hazmat.backends import default_backend
+from cryptography.hazmat.primitives.asymmetric import rsa
 import jwt, os, uuid, base64, logging
 from datetime import datetime, timedelta
-from cryptography.hazmat.primitives.ciphers.aead import AESGCM
 from argon2 import PasswordHasher
 
-
-# Initialize Flask app and SQLAlchemy
 app = Flask(__name__)
 app.config['SQLALCHEMY_DATABASE_URI'] = 'sqlite:///totally_not_my_privateKeys.db'
 db = SQLAlchemy(app)
-ph = PasswordHasher()
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 
-encoded_jwt = jwt.encode({"sub": str(user_id)}, user_key, algorithm="RS256", headers={"kid": str(key.id)})
-
-return jsonify({'token': encoded_jwt})
-
-# Define the database model for storing keys
 class RSAKey(db.Model):
     id = db.Column(db.Integer, primary_key=True)
-    key_data = db.Column(db.LargeBinary, nullable=False)  # Adjusted for binary storage
+    key_data = db.Column(db.LargeBinary, nullable=False)  # Storing as bytes
     expiration = db.Column(db.DateTime, nullable=False)
-
 
 class User(db.Model):
     id = db.Column(db.Integer, primary_key=True)
@@ -40,98 +31,94 @@ class AuthLog(db.Model):
     request_timestamp = db.Column(db.DateTime, default=datetime.utcnow)
     user_id = db.Column(db.Integer, db.ForeignKey('user.id'), nullable=True)
 
+def get_aes_key():
+    key = os.getenv('NOT_MY_KEY')
+    if key is None:
+        logging.error("AES encryption key 'NOT_MY_KEY' not found in environment variables.")
+        raise ValueError("AES encryption key 'NOT_MY_KEY' not found in environment variables.")
+    key_bytes = base64.urlsafe_b64decode(key)
+    if len(key_bytes) not in [16, 24, 32]:
+        logging.error("AES encryption key must be either 16, 24, or 32 bytes long.")
+        raise ValueError("AES encryption key must be either 16, 24, or 32 bytes long.")
+    return key_bytes
+
 @app.route('/register', methods=['POST'])
 def register():
     data = request.json
     username = data['username']
     email = data['email']
     password = str(uuid.uuid4())
+    ph = PasswordHasher()
     password_hash = ph.hash(password)
-
     user = User(username=username, email=email, password_hash=password_hash)
     db.session.add(user)
     db.session.commit()
-
     return jsonify({"password": password}), 201
 
-def get_aes_key():
-    key = os.getenv('NOT_MY_KEY')
-
-    if key is None:
-        logging.error("AES encryption key 'NOT_MY_KEY' not found in environment variables.")
-        raise ValueError("AES encryption key 'NOT_MY_KEY' not found in environment variables.")
-
-    key_bytes = key.encode()
-
-    if len(key_bytes) not in [16, 24, 32]:
-        logging.error("AES encryption key must be either 16, 24, or 32 bytes long.")
-        raise ValueError("AES encryption key must be either 16, 24, or 32 bytes long.")
-    return key_bytes
-
-
-def encrypt_key(private_key_bytes):
-    aes_gcm = AESGCM(get_aes_key())
-    nonce = os.urandom(12)
-    encrypted = aes_gcm.encrypt(nonce, private_key_bytes, None)
-    encrypted_data = nonce + encrypted
-    return base64.b64encode(encrypted_data).decode()  # Encode as base64 for storage
-
-def decrypt_key(encrypted_key):
-    aes_gcm = AESGCM(get_aes_key())
-    encrypted_data = base64.b64decode(encrypted_key)  # Decode from base64
-    nonce, ciphertext = encrypted_data[:12], encrypted_data[12:]
-    return aes_gcm.decrypt(nonce, ciphertext, None)
-
-
-# Serializes RSA keys for storage
 def serialize_key(key):
-    return key.private_bytes(encoding=serialization.Encoding.PEM, format=serialization.PrivateFormat.PKCS8, encryption_algorithm=serialization.NoEncryption()).decode()
+    return key.private_bytes(
+        encoding=serialization.Encoding.PEM,
+        format=serialization.PrivateFormat.PKCS8,
+        encryption_algorithm=serialization.NoEncryption()
+    )
 
-# Deserializes stored RSA keys
-def deserialize_key(key_str):
-    return serialization.load_pem_private_key(key_str.encode(), None, default_backend())
+def deserialize_key(key_data):
+    return serialization.load_pem_private_key(key_data, None, default_backend())
 
-# Saves keys to the database
-def store_key(key, exp):
-    db.session.add(RSAKey(key_data=serialize_key(key), expiration=int(exp.timestamp())))
+def store_key(key, expiration):
+    db.session.add(RSAKey(key_data=serialize_key(key), expiration=expiration))
     db.session.commit()
 
-# Generates and stores RSA key pairs
 def generate_and_store_keys():
-    key_gen = lambda: asymmetric.rsa.generate_private_key(public_exponent=65537, key_size=2048, backend=default_backend())
-    store_key(key_gen(), datetime.utcnow())
-    store_key(key_gen(), datetime.utcnow() + datetime.timedelta(hours=1))
+    key_gen = lambda: rsa.generate_private_key(public_exponent=65537, key_size=2048, backend=default_backend())
+    now = datetime.utcnow()
+    store_key(key_gen(), now + timedelta(hours=1))  # Valid key
+    store_key(key_gen(), now - timedelta(hours=1))  # Expired key
 
 @app.route('/.well-known/jwks.json', methods=['GET'])
-    def serve_jwks():
+def serve_jwks():
     try:
-        keys = RSAKey.query.filter(RSAKey.expiration > datetime.utcnow()).all()
-        jwks = {'keys': [{'kid': str(k.id), 'kty': 'RSA', 'alg': 'RS256', 'use': 'sig', 'n': deserialize_key(k.key_data).public_key().public_bytes(encoding=serialization.Encoding.PEM, format=serialization.PublicFormat.SubjectPublicKeyInfo).decode().split('\n')[1], 'e': 'AQAB'} for k in keys]}
-            return jsonify(jwks)
+        valid_keys = RSAKey.query.filter(RSAKey.expiration > datetime.utcnow()).all()
+        jwks = {
+            'keys': [{
+                'kty': 'RSA',
+                'use': 'sig',
+                'kid': str(key.id),
+                'alg': 'RS256',
+                'n': base64.urlsafe_b64encode(rsa.RSAPublicNumbers(
+                        e=deserialize_key(key.key_data).public_key().public_numbers().e,
+                        n=deserialize_key(key.key_data).public_key().public_numbers().n
+                    ).public_key(default_backend()).public_bytes(
+                        Encoding.DER, PublicFormat.SubjectPublicKeyInfo
+                    )).decode('utf-8'),
+                'e': 'AQAB',
+            } for key in valid_keys]
+        }
+        return jsonify(jwks)
     except Exception as e:
         logging.error(f"JWKS Endpoint Error: {str(e)}")
         return jsonify({'error': 'Internal Server Error'}), 500
 
 @app.route('/auth', methods=['POST'])
 def authenticate_user():
-    key_query = lambda exp: RSAKey.query.filter(RSAKey.expiration <= datetime.utcnow().timestamp()) if exp else RSAKey.query.filter(RSAKey.expiration > datetime.utcnow().timestamp())
-    key = key_query(request.args.get('expired')).first()
+    expired_param = request.args.get('expired', 'false').lower() == 'true'
+    key_query = RSAKey.query.filter(RSAKey.expiration <= datetime.utcnow()) if expired_param else RSAKey.query.filter(RSAKey.expiration > datetime.utcnow())
+    key = key_query.order_by(RSAKey.expiration.desc() if expired_param else RSAKey.expiration.asc()).first()
 
-    request_ip = request.remote_addr
-    user = User.query.filter_by(username=request.json.get('username')).first()
-    log_entry = AuthLog(request_ip=request_ip, user_id=user.id if user else None)
-    db.session.add(log_entry)
-    db.session.commit()
-
-    if not key:
-        return jsonify({'error': 'Key unavailable'}), 500
-
-    try:
-        user_key = deserialize_key(key.key_data)
-        token = jwt.encode({'sub': 'fake_user'}, user_key, algorithm='RS256', headers={'kid': str(key.id)})
-        return jsonify({'token': token})
-    except Exception as e:
-        return jsonify({'error': 'Failed to process authentication', 'details': str(e)}), 500
+    if key:
+        try:
+            token = jwt.encode(
+                {"sub": "user123"},
+                deserialize_key(key.key_data),
+                algorithm="RS256",
+                headers={"kid": str(key.id)}
+            )
+            return jsonify({'token': token})
+        except Exception as e:
+            logging.error(f"JWT Generation Error: {str(e)}")
+            return jsonify({'error': 'Failed to generate JWT'}), 500
+    else:
+        return jsonify({'error': 'Appropriate key not found'}), 404
 
 if __name__ == '__main__':
     with app.app_context():
