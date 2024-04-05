@@ -17,7 +17,7 @@ Installation
 Clone the repository
 bash
 Copy code
-git clone https://github.com/yourgithubusername/your-repository-name.git
+git clone https://github.com/xmike04/jkws-project2.git
 cd your-repository-name
 Set up a virtual environment (optional but recommended):
 bash
