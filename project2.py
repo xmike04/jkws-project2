@@ -15,6 +15,12 @@ class Key(db.Model):
     key = db.Column(db.Text, nullable=False)
     exp = db.Column(db.Integer, nullable=False)
 
+class TestConfig:
+    TESTING = True
+    SQLALCHEMY_DATABASE_URI = 'sqlite:///:memory:'  # Use an in-memory database for tests
+    SQLALCHEMY_TRACK_MODIFICATIONS = False
+
+
 # Function to serialize RSA private key to PEM format
 def serialize_private_key(private_key):
     return private_key.private_bytes(
@@ -75,14 +81,17 @@ def authenticate():
     try:
         expired_param = request.args.get('expired')
 
-        if expired_param:
-            key = Key.query.first()
+        if expired_param == 'true':
+            current_time = datetime.datetime.utcnow()
+            key = Key.query.filter(Key.exp <= current_time.timestamp()).order_by(Key.exp.desc()).first()
         else:
             current_time = datetime.datetime.utcnow()
-            key = Key.query.filter(Key.exp > current_time.timestamp()).first()
+            key = Key.query.filter(Key.exp > current_time.timestamp()).order_by(Key.exp.asc()).first()
+
 
             if not key:
-                return jsonify({'error': 'No valid keys available'}), 500
+                return jsonify({'error': 'No keys found'}), 404
+
 
         private_key = serialization.load_pem_private_key(key.key.encode(), password=None, backend=default_backend())
 
@@ -94,7 +103,7 @@ def authenticate():
         print(f"An error occurred: {str(e)}")
         import traceback
         traceback.print_exc()
-        return jsonify({'error': 'Internal Server Error'}), 500
+        return jsonify({'error': 'Internal Server Error', 'details': str(e)}), 500
 
 if __name__ == '__main__':
     app.run(port=8080, debug=True)
