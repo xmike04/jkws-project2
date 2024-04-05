@@ -6,7 +6,7 @@ import jwt, datetime
 
 # Initialize Flask app and SQLAlchemy
 app = Flask(__name__)
-app.config['SQLALCHEMY_DATABASE_URI'] = 'sqlite:///keys_database.db'
+app.config['SQLALCHEMY_DATABASE_URI'] = 'sqlite:///totally_not_my_privateKeys.db'
 db = SQLAlchemy(app)
 
 # Define the database model for storing keys
