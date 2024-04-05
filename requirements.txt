@@ -1,0 +1,8 @@
+Flask
+SQLAlchemy
+PyJWT
+cryptography
+argon2-cffi
+flask
+jwt
+Flask-SQLAlchemy

@@ -15,6 +15,10 @@ db = SQLAlchemy(app)
 ph = PasswordHasher()
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 
+encoded_jwt = jwt.encode({"sub": str(user_id)}, user_key, algorithm="RS256", headers={"kid": str(key.id)})
+
+return jsonify({'token': encoded_jwt})
+
 # Define the database model for storing keys
 class RSAKey(db.Model):
     id = db.Column(db.Integer, primary_key=True)
@@ -99,10 +103,14 @@ def generate_and_store_keys():
     store_key(key_gen(), datetime.utcnow() + datetime.timedelta(hours=1))
 
 @app.route('/.well-known/jwks.json', methods=['GET'])
-def serve_jwks():
-    keys = RSAKey.query.filter(RSAKey.expiration > datetime.utcnow().timestamp()).all()
-    jwks = {'keys': [{'kid': str(k.id), 'kty': 'RSA', 'alg': 'RS256', 'use': 'sig', 'n': deserialize_key(k.key_data).public_key().public_bytes(encoding=serialization.Encoding.PEM, format=serialization.PublicFormat.SubjectPublicKeyInfo).decode().split('\n')[1], 'e': 'AQAB'} for k in keys]}
-    return jsonify(jwks)
+    def serve_jwks():
+    try:
+        keys = RSAKey.query.filter(RSAKey.expiration > datetime.utcnow()).all()
+        jwks = {'keys': [{'kid': str(k.id), 'kty': 'RSA', 'alg': 'RS256', 'use': 'sig', 'n': deserialize_key(k.key_data).public_key().public_bytes(encoding=serialization.Encoding.PEM, format=serialization.PublicFormat.SubjectPublicKeyInfo).decode().split('\n')[1], 'e': 'AQAB'} for k in keys]}
+            return jsonify(jwks)
+    except Exception as e:
+        logging.error(f"JWKS Endpoint Error: {str(e)}")
+        return jsonify({'error': 'Internal Server Error'}), 500
 
 @app.route('/auth', methods=['POST'])
 def authenticate_user():

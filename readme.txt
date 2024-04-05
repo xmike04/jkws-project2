@@ -24,6 +24,7 @@ bash
 Copy code
 python3 -m venv venv
 source venv/bin/activate  # On Windows use `venv\Scripts\activate`
+run: python3 key.py to get placeholder key
 Install the required packages:
 bash
 Copy code
@@ -64,6 +65,7 @@ Copy code
 curl -X POST -H "Content-Type: application/json" -d '{}' http://127.0.0.1:5000/register
 Authenticate a User:
 
+Authenticate User:
 bash
 Copy code
 curl -X POST -H "Content-Type: application/json" -d '{
