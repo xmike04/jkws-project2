@@ -1,109 +1,62 @@
 from flask import Flask, jsonify, request
-from cryptography.hazmat.primitives import serialization
-from cryptography.hazmat.primitives.asymmetric import rsa
-from cryptography.hazmat.backends import default_backend
-import jwt
-import datetime
 from flask_sqlalchemy import SQLAlchemy
+from cryptography.hazmat.primitives import serialization, asymmetric
+from cryptography.hazmat.backends import default_backend
+import jwt, datetime
 
+# Initialize Flask app and SQLAlchemy
 app = Flask(__name__)
-app.config['SQLALCHEMY_DATABASE_URI'] = 'sqlite:///totally_not_my_privateKeys.db'
+app.config['SQLALCHEMY_DATABASE_URI'] = 'sqlite:///keys_database.db'
 db = SQLAlchemy(app)
 
-class Key(db.Model):
+# Define the database model for storing keys
+class RSAKey(db.Model):
     id = db.Column(db.Integer, primary_key=True)
-    key = db.Column(db.Text, nullable=False)
-    exp = db.Column(db.Integer, nullable=False)
+    key_data = db.Column(db.Text, not_null=True)
+    expiration = db.Column(db.Integer, not_null=True)
 
-class TestConfig:
-    TESTING = True
-    SQLALCHEMY_DATABASE_URI = 'sqlite:///:memory:'  # Use an in-memory database for tests
-    SQLALCHEMY_TRACK_MODIFICATIONS = False
+# Serializes RSA keys for storage
+def serialize_key(key):
+    return key.private_bytes(encoding=serialization.Encoding.PEM, format=serialization.PrivateFormat.PKCS8, encryption_algorithm=serialization.NoEncryption()).decode()
 
+# Deserializes stored RSA keys
+def deserialize_key(key_str):
+    return serialization.load_pem_private_key(key_str.encode(), None, default_backend())
 
-# Function to serialize RSA private key to PEM format
-def serialize_private_key(private_key):
-    return private_key.private_bytes(
-        encoding=serialization.Encoding.PEM,
-        format=serialization.PrivateFormat.PKCS8,
-        encryption_algorithm=serialization.NoEncryption()
-    )
-
-# Function to save private key to the database
-def save_private_key_to_db(private_key, expiry):
-    serialized_key = serialize_private_key(private_key).decode()
-    new_key = Key(key=serialized_key, exp=expiry)
-    db.session.add(new_key)
+# Saves keys to the database
+def store_key(key, exp):
+    db.session.add(RSAKey(key_data=serialize_key(key), expiration=int(exp.timestamp())))
     db.session.commit()
 
-# Generate key pair and save to DB
-def generate_key_pair_and_save():
-    private_key = rsa.generate_private_key(
-        public_exponent=65537,
-        key_size=2048,
-        backend=default_backend()
-    )
-    expiry = datetime.datetime.utcnow() + datetime.timedelta(hours=1)  # Expire in 1 hour
-    save_private_key_to_db(private_key, expiry)
+# Generates and stores RSA key pairs
+def generate_and_store_keys():
+    key_gen = lambda: asymmetric.rsa.generate_private_key(public_exponent=65537, key_size=2048, backend=default_backend())
+    store_key(key_gen(), datetime.datetime.utcnow())
+    store_key(key_gen(), datetime.datetime.utcnow() + datetime.timedelta(hours=1))
 
-with app.app_context():  # Enter Flask application context
-    db.create_all()  # Create the database tables
-
-    generate_key_pair_and_save()  # Generate and save at least one key for testing
-
-# JWKS endpoint
 @app.route('/.well-known/jwks.json', methods=['GET'])
-def jwks():
-    current_time = datetime.datetime.utcnow()
-    valid_keys = Key.query.filter(Key.exp > current_time.timestamp()).all()
+def serve_jwks():
+    keys = RSAKey.query.filter(RSAKey.expiration > datetime.datetime.utcnow().timestamp()).all()
+    jwks = {'keys': [{'kid': str(k.id), 'kty': 'RSA', 'alg': 'RS256', 'use': 'sig', 'n': deserialize_key(k.key_data).public_key().public_bytes(encoding=serialization.Encoding.PEM, format=serialization.PublicFormat.SubjectPublicKeyInfo).decode().split('\n')[1], 'e': 'AQAB'} for k in keys]}
+    return jsonify(jwks)
 
-    jwks_data = {
-        'keys': [
-            {
-                'kid': str(key.id),
-                'kty': 'RSA',
-                'alg': 'RS256',
-                'use': 'sig',
-                'n': serialization.load_pem_private_key(key.key.encode(), password=None, backend=default_backend()).public_key().public_bytes(
-                    encoding=serialization.Encoding.PEM,
-                    format=serialization.PublicFormat.SubjectPublicKeyInfo
-                ).decode().split('\n')[1],
-                'e': 'AQAB'
-            } for key in valid_keys
-        ]
-    }
-
-    return jsonify(jwks_data)
-
-# Authentication endpoint
 @app.route('/auth', methods=['POST'])
-def authenticate():
+def authenticate_user():
+    key_query = lambda exp: RSAKey.query.filter(RSAKey.expiration <= datetime.datetime.utcnow().timestamp()) if exp else RSAKey.query.filter(RSAKey.expiration > datetime.datetime.utcnow().timestamp())
+    key = key_query(request.args.get('expired')).first()
+
+    if not key:
+        return jsonify({'error': 'Key unavailable'}), 500
+
     try:
-        expired_param = request.args.get('expired')
-
-        if expired_param == 'true':
-            current_time = datetime.datetime.utcnow()
-            key = Key.query.filter(Key.exp <= current_time.timestamp()).order_by(Key.exp.desc()).first()
-        else:
-            current_time = datetime.datetime.utcnow()
-            key = Key.query.filter(Key.exp > current_time.timestamp()).order_by(Key.exp.asc()).first()
-
-
-            if not key:
-                return jsonify({'error': 'No keys found'}), 404
-
-
-        private_key = serialization.load_pem_private_key(key.key.encode(), password=None, backend=default_backend())
-
-        token_payload = {'sub': 'fake_user'}
-        jwt_token = jwt.encode(token_payload, private_key, algorithm='RS256', headers={'kid': str(key.id)})
-
-        return jsonify({'token': jwt_token})
+        user_key = deserialize_key(key.key_data)
+        token = jwt.encode({'sub': 'fake_user'}, user_key, algorithm='RS256', headers={'kid': str(key.id)})
+        return jsonify({'token': token})
     except Exception as e:
-        print(f"An error occurred: {str(e)}")
-        import traceback
-        traceback.print_exc()
-        return jsonify({'error': 'Internal Server Error', 'details': str(e)}), 500
+        return jsonify({'error': 'Failed to process authentication', 'details': str(e)}), 500
 
 if __name__ == '__main__':
+    with app.app_context():
+        db.create_all()
+        generate_and_store_keys()
     app.run(port=8080, debug=True)
